@@ -28,6 +28,54 @@ GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.is_admin() TO anon;
 
 -- ============================================
+-- STEP 1.5: Create function to check if user is vendor (bypasses RLS)
+-- ============================================
+CREATE OR REPLACE FUNCTION public.is_vendor()
+RETURNS UUID
+LANGUAGE sql
+SECURITY DEFINER
+STABLE
+AS $$
+  SELECT id FROM public.vendors WHERE user_id = auth.uid() LIMIT 1;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.is_vendor() TO authenticated;
+GRANT EXECUTE ON FUNCTION public.is_vendor() TO anon;
+
+-- ============================================
+-- STEP 1.6: Create function to check if vendor can view order (bypasses RLS)
+-- ============================================
+-- This function checks if the current user (as vendor) can view an order
+-- by checking order_items directly, bypassing RLS to prevent recursion
+CREATE OR REPLACE FUNCTION public.vendor_can_view_order(order_uuid UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+AS $$
+DECLARE
+  vendor_uuid UUID;
+BEGIN
+  -- Get vendor ID for current user (bypasses RLS)
+  SELECT id INTO vendor_uuid FROM public.vendors WHERE user_id = auth.uid() LIMIT 1;
+  
+  -- If user is not a vendor, return false
+  IF vendor_uuid IS NULL THEN
+    RETURN false;
+  END IF;
+  
+  -- Check if any order_items belong to this vendor (bypasses RLS)
+  RETURN EXISTS (
+    SELECT 1 FROM public.order_items
+    WHERE order_id = order_uuid AND vendor_id = vendor_uuid
+  );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.vendor_can_view_order(UUID) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.vendor_can_view_order(UUID) TO anon;
+
+-- ============================================
 -- STEP 2: Drop ALL existing orders policies
 -- ============================================
 DROP POLICY IF EXISTS "Users can view own orders" ON public.orders;
@@ -45,18 +93,10 @@ CREATE POLICY "Users can view own orders" ON public.orders
     FOR SELECT USING (auth.uid() = user_id);
 
 -- Vendors can view orders for their products
--- FIXED: Check vendor_id directly from order_items without circular reference
--- This avoids querying orders table from within orders policy
+-- FIXED: Use vendor_can_view_order() function which bypasses RLS entirely
+-- This completely prevents recursion by using SECURITY DEFINER function
 CREATE POLICY "Vendors can view own orders" ON public.orders
-    FOR SELECT USING (
-        EXISTS (
-            SELECT 1 FROM public.order_items oi
-            WHERE oi.order_id = orders.id 
-            AND oi.vendor_id IN (
-                SELECT id FROM public.vendors WHERE user_id = auth.uid()
-            )
-        )
-    );
+    FOR SELECT USING (public.vendor_can_view_order(orders.id));
 
 -- Admins can view all orders (using is_admin() function - no recursion)
 CREATE POLICY "Admins can view all orders" ON public.orders
@@ -91,13 +131,9 @@ CREATE POLICY "Users can view own order items" ON public.order_items
         )
     );
 
--- Vendors can view items for their products (check vendor_id directly)
+-- Vendors can view items for their products (use is_vendor() function)
 CREATE POLICY "Vendors can view own order items" ON public.order_items
-    FOR SELECT USING (
-        vendor_id IN (
-            SELECT id FROM public.vendors WHERE user_id = auth.uid()
-        )
-    );
+    FOR SELECT USING (vendor_id = public.is_vendor());
 
 -- Admins can view all order items (using is_admin() function)
 CREATE POLICY "Admins can view all order items" ON public.order_items
